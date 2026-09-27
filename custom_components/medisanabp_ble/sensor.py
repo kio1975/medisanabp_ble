@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from .medisana_bp import MedisanaBPSensor, SensorUpdate
 
 from homeassistant import config_entries
@@ -37,17 +39,20 @@ SENSOR_DESCRIPTIONS: dict[str, SensorEntityDescription] = {
         key=MedisanaBPSensor.SYSTOLIC,
         native_unit_of_measurement=UnitOfPressure.MMHG,
         device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:water-minus",
     ),
     MedisanaBPSensor.DIASTOLIC: SensorEntityDescription(
         key=MedisanaBPSensor.DIASTOLIC,
         native_unit_of_measurement=UnitOfPressure.MMHG,
         device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:water-plus",
     ),
     MedisanaBPSensor.PULSE: SensorEntityDescription(
         key=MedisanaBPSensor.PULSE,
         native_unit_of_measurement="bpm",
+        state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:heart-flash",
     ),
     MedisanaBPSensor.SIGNAL_STRENGTH: SensorEntityDescription(
@@ -70,6 +75,10 @@ SENSOR_DESCRIPTIONS: dict[str, SensorEntityDescription] = {
         device_class=SensorDeviceClass.TIMESTAMP,
         icon="mdi:clock-time-four-outline",
     ),
+    MedisanaBPSensor.USER: SensorEntityDescription(
+        key=MedisanaBPSensor.USER,
+        icon="mdi:account",
+    ),
 
 }
 
@@ -88,6 +97,7 @@ def sensor_update_to_bluetooth_data_update(
                 device_key.key
             ]
             for device_key in sensor_update.entity_descriptions
+            if device_key.key in SENSOR_DESCRIPTIONS
         },
         entity_data={
             device_key_to_bluetooth_entity_key(device_key): sensor_values.native_value
@@ -127,9 +137,18 @@ class MedisanaBPBluetoothSensorEntity(
     """Representation of a MedisanaBP sensor."""
 
     @property
-    def native_value(self) -> str | int | None:
+    def native_value(self) -> datetime | str | int | float | None:
         """Return the native value."""
-        return self.processor.entity_data.get(self.entity_key)
+        val = self.processor.entity_data.get(self.entity_key)
+        if (
+            isinstance(val, str)
+            and self.entity_description.device_class == SensorDeviceClass.TIMESTAMP
+        ):
+            try:
+                return datetime.fromisoformat(val)
+            except (ValueError, TypeError):
+                return None
+        return val
 
     @property
     def available(self) -> bool:

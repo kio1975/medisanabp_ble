@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import Callable
 
-from bleak import BLEDevice
+from bleak import BLEDevice, BleakClient, BleakError
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     establish_connection,
-    retry_bluetooth_connection_error,
 )
 from bluetooth_data_tools import short_address
 from bluetooth_sensor_state_data import BluetoothData
@@ -25,6 +25,20 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def decode_sfloat(raw: int) -> float | None:
+    """Decode IEEE 11073 16-bit SFLOAT to float."""
+    mantissa = raw & 0x0FFF
+    if mantissa >= 0x0800:
+        mantissa -= 0x1000
+    exponent = raw >> 12
+    if exponent >= 0x08:
+        exponent -= 0x10
+    # Special values in IEEE 11073 (NaN, NRes, +/- Infinity)
+    if mantissa in (0x07FE, 0x07FF, -0x0800, 0x0800, 0x0802):
+        return None
+    return mantissa * (10 ** exponent)
+
+
 class MedisanaBPSensor(StrEnum):
 
     SYSTOLIC = "systolic"
@@ -33,6 +47,7 @@ class MedisanaBPSensor(StrEnum):
     SIGNAL_STRENGTH = "signal_strength"
     BATTERY_PERCENT = "battery_percent"
     TIMESTAMP = "timestamp"
+    USER = "user"
 
 
 class MedisanaBPBluetoothDeviceData(BluetoothData):
@@ -41,6 +56,8 @@ class MedisanaBPBluetoothDeviceData(BluetoothData):
     def __init__(self) -> None:
         super().__init__()
         self._event = asyncio.Event()
+        self._has_data = False
+        self._last_poll_successful = False
 
     def _start_update(self, service_info: BluetoothServiceInfo) -> None:
         """Update from BLE advertisement data."""
@@ -58,37 +75,141 @@ class MedisanaBPBluetoothDeviceData(BluetoothData):
         This is called every time we get a service_info for a device. It means the
         device is working and online.
         """
-        return not last_poll or last_poll > UPDATE_INTERVAL
+        if not last_poll:
+            return True
+        if not self._last_poll_successful:
+            return last_poll > 2
+        return last_poll > UPDATE_INTERVAL
 
-    @retry_bluetooth_connection_error()
-    def notification_handler(self, _, data) -> None:
-        """Helper for command events"""
-        syst = data[2] * 256 + data[1]
-        diast = data[4] * 256 + data[3]
-        arter = data[6] * 256 + data[5]
-        dyear = data[8] * 256 + data[7]
-        dmonth = data[9]
-        dday = data[10]
-        dhour = data[11]
-        dminu = data[12]
-        puls = data[15] * 256 + data[14]
-        user = data[16]
-        try:
-            datetime_str = f"{dyear}/{dmonth}/{dday} {dhour}:{dminu:0>2}"
-            date = datetime.strptime(datetime_str, '%Y/%m/%d %H:%M')
-            local_timezone = datetime.now(timezone.utc).astimezone().tzinfo
+    def notification_handler(self, _, data: bytearray | bytes) -> None:
+        """Helper for blood pressure measurement indications."""
+        # The 1st record is the latest; ignore any older subsequent records
+        if self._has_data:
+            return
+
+        if not data or len(data) < 7:
+            _LOGGER.warning(
+                "Received invalid blood pressure data length: %s",
+                len(data) if data else 0,
+            )
+            return
+
+        flags = data[0]
+        # Bit 0: 0 = mmHg, 1 = kPa
+        is_kpa = bool(flags & 0x01)
+        # Bit 1: Time Stamp Flag
+        has_timestamp = bool(flags & 0x02)
+        # Bit 2: Pulse Rate Flag
+        has_pulse = bool(flags & 0x04)
+        # Bit 3: User ID Flag
+        has_user_id = bool(flags & 0x08)
+        # Bit 4: Measurement Status Flag
+        has_status = bool(flags & 0x10)
+
+        raw_syst = data[1] | (data[2] << 8)
+        raw_diast = data[3] | (data[4] << 8)
+        raw_arter = data[5] | (data[6] << 8)
+
+        syst = decode_sfloat(raw_syst)
+        diast = decode_sfloat(raw_diast)
+        arter = decode_sfloat(raw_arter)
+
+        if syst is None or diast is None:
+            _LOGGER.warning("Invalid blood pressure values in data: %s", data.hex())
+            return
+
+        if is_kpa:
+            # 1 kPa = 7.50062 mmHg
+            syst = round(syst * 7.50062)
+            diast = round(diast * 7.50062)
+        else:
+            syst = round(syst)
+            diast = round(diast)
+
+        offset = 7
+        date = None
+        if has_timestamp:
+            if len(data) >= offset + 7:
+                dyear = data[offset] | (data[offset + 1] << 8)
+                dmonth = data[offset + 2]
+                dday = data[offset + 3]
+                dhour = data[offset + 4]
+                dminu = data[offset + 5]
+                dsec = data[offset + 6]
+                offset += 7
+                try:
+                    if (
+                        dyear >= 2000
+                        and 1 <= dmonth <= 12
+                        and 1 <= dday <= 31
+                        and 0 <= dhour <= 23
+                        and 0 <= dminu <= 59
+                    ):
+                        dsec = min(59, max(0, dsec))
+                        date = datetime(
+                            dyear, dmonth, dday, dhour, dminu, dsec
+                        ).astimezone()
+                except (ValueError, OverflowError) as err:
+                    _LOGGER.debug(
+                        "Could not parse date (%04d-%02d-%02d %02d:%02d:%02d): %s",
+                        dyear,
+                        dmonth,
+                        dday,
+                        dhour,
+                        dminu,
+                        dsec,
+                        err,
+                    )
+            else:
+                _LOGGER.warning(
+                    "Packet flagged timestamp but data was truncated (len=%d)",
+                    len(data),
+                )
+
+        puls = None
+        if has_pulse:
+            if len(data) >= offset + 2:
+                raw_puls = data[offset] | (data[offset + 1] << 8)
+                puls_val = decode_sfloat(raw_puls)
+                if puls_val is not None:
+                    puls = round(puls_val)
+                offset += 2
+            else:
+                _LOGGER.warning(
+                    "Packet flagged pulse rate but data was truncated (len=%d)",
+                    len(data),
+                )
+
+        user = None
+        if has_user_id:
+            if len(data) >= offset + 1:
+                user = data[offset] + 1
+                offset += 1
+
+        _LOGGER.info(
+            "Got data from BPM device (syst: %s, diast: %s, puls: %s, user: %s, date: %s)",
+            syst,
+            diast,
+            puls,
+            user,
+            date,
+        )
+
+        if date is not None:
             self.update_sensor(
                 key=str(MedisanaBPSensor.TIMESTAMP),
                 native_unit_of_measurement=None,
-                native_value=date.replace(tzinfo=local_timezone),
+                native_value=date,
                 name="Measured Date",
             )
-        except:
-            _LOGGER.error("Can't add Measured Date")
 
-        _LOGGER.info(
-            "Got data from BPM device (syst: %s, diast: %s, puls: %s)",
-            syst, diast, puls)
+        if user is not None:
+            self.update_sensor(
+                key=str(MedisanaBPSensor.USER),
+                native_unit_of_measurement=None,
+                native_value=user,
+                name="User",
+            )
 
         self.update_sensor(
             key=str(MedisanaBPSensor.SYSTOLIC),
@@ -104,49 +225,97 @@ class MedisanaBPBluetoothDeviceData(BluetoothData):
             device_class=SensorDeviceClass.PRESSURE,
             name="Diastolic",
         )
-        self.update_sensor(
-            key=str(MedisanaBPSensor.PULSE),
-            native_unit_of_measurement="bpm",
-            native_value=puls,
-            name="Pulse",
-        )
-        self._event.set()
-        return
-
-    async def async_poll(self, ble_device: BLEDevice) -> SensorUpdate:
-        """
-        Poll the device to retrieve any values we can't get from passive listening.
-        """
-        _LOGGER.debug("Connecting to BLE device: %s", ble_device.address)
-        client = await establish_connection(
-            BleakClientWithServiceCache, ble_device, ble_device.address
-        )
-        try:
-            await client.start_notify(
-                CHARACTERISTIC_BLOOD_PRESSURE, self.notification_handler
+        if puls is not None:
+            self.update_sensor(
+                key=str(MedisanaBPSensor.PULSE),
+                native_unit_of_measurement="bpm",
+                native_value=puls,
+                name="Pulse",
             )
-        except:
-            _LOGGER.warn("Notify Bleak error")
 
-        battery_char = client.services.get_characteristic(CHARACTERISTIC_BATTERY)
-        battery_payload = await client.read_gatt_char(battery_char)
-        self.update_sensor(
-            key=str(MedisanaBPSensor.BATTERY_PERCENT),
-            native_unit_of_measurement=Units.PERCENTAGE,
-            native_value=battery_payload[0],
-            device_class=SensorDeviceClass.BATTERY,
-            name="Battery",
+        self._has_data = True
+        self._event.set()
+
+    async def async_poll(
+        self,
+        ble_device: BLEDevice,
+        ble_device_callback: Callable[[], BLEDevice] | None = None,
+    ) -> SensorUpdate:
+        """Poll the device to retrieve any values we can't get from passive listening."""
+        _LOGGER.debug("Connecting to BLE device: %s", ble_device.address)
+        self._event.clear()
+        self._has_data = False
+
+        def _disconnected_callback(client: BleakClient) -> None:
+            _LOGGER.debug("BLE device disconnected: %s", client.address)
+            self._event.set()
+
+        client = await establish_connection(
+            BleakClientWithServiceCache,
+            ble_device,
+            ble_device.address,
+            disconnected_callback=_disconnected_callback,
+            ble_device_callback=ble_device_callback,
         )
-
-        # Wait to see if a callback comes in.
         try:
-            await asyncio.wait_for(self._event.wait(), 15)
-        except asyncio.TimeoutError:
-            _LOGGER.warn("Timeout getting command data.")
-        except:
-            _LOGGER.warn("Wait For Bleak error")
+            try:
+                await client.start_notify(
+                    CHARACTERISTIC_BLOOD_PRESSURE, self.notification_handler
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Bleak error starting notify on %s: %s", ble_device.address, err
+                )
+                return self._finish_update()
+
+            # Wait to see if the first (latest) measurement arrives.
+            try:
+                await asyncio.wait_for(self._event.wait(), 15)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Timeout getting command data from %s.", ble_device.address
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Error waiting for data from %s: %s", ble_device.address, err
+                )
+
+            # Read battery if still connected
+            if client.is_connected:
+                try:
+                    if battery_char := client.services.get_characteristic(
+                        CHARACTERISTIC_BATTERY
+                    ):
+                        battery_payload = await client.read_gatt_char(battery_char)
+                        if battery_payload:
+                            self.update_sensor(
+                                key=str(MedisanaBPSensor.BATTERY_PERCENT),
+                                native_unit_of_measurement=Units.PERCENTAGE,
+                                native_value=battery_payload[0],
+                                device_class=SensorDeviceClass.BATTERY,
+                                name="Battery",
+                            )
+                except (BleakError, asyncio.TimeoutError) as err:
+                    _LOGGER.debug(
+                        "Could not read battery from %s: %s", ble_device.address, err
+                    )
         finally:
-            await client.stop_notify(CHARACTERISTIC_BLOOD_PRESSURE)
-            await client.disconnect()
-            _LOGGER.debug("Disconnected from active bluetooth client")
+            if client.is_connected:
+                try:
+                    await client.stop_notify(CHARACTERISTIC_BLOOD_PRESSURE)
+                except (BleakError, asyncio.TimeoutError, Exception) as err:
+                    _LOGGER.debug(
+                        "Error stopping notify on %s: %s", ble_device.address, err
+                    )
+                try:
+                    await client.disconnect()
+                except (BleakError, asyncio.TimeoutError, Exception) as err:
+                    _LOGGER.debug(
+                        "Error disconnecting %s: %s", ble_device.address, err
+                    )
+            _LOGGER.debug(
+                "Disconnected from active bluetooth client: %s", ble_device.address
+            )
+
+        self._last_poll_successful = self._has_data
         return self._finish_update()

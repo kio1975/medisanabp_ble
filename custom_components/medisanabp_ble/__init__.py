@@ -40,7 +40,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.state is CoreState.running
             and data.poll_needed(service_info, last_poll)
             and bool(
-                async_ble_device_from_address(
+                service_info.connectable
+                or async_ble_device_from_address(
                     hass, service_info.device.address, connectable=True
                 )
             )
@@ -48,7 +49,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _async_poll(service_info: BluetoothServiceInfoBleak) -> SensorUpdate:
         # BluetoothServiceInfoBleak is defined in HA, otherwise would just pass it
-        # directly to the elissabp code
+        # directly to the parser code
         # Make sure the device we have is one that we can connect with
         # in case its coming from a passive scanner
         if service_info.connectable:
@@ -63,7 +64,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise RuntimeError(
                 f"No connectable device found for {service_info.device.address}"
             )
-        return await data.async_poll(connectable_device)
+        return await data.async_poll(
+            connectable_device,
+            ble_device_callback=lambda: async_ble_device_from_address(
+                hass, service_info.device.address, True
+            )
+            or connectable_device,
+        )
 
     coordinator = hass.data.setdefault(DOMAIN, {})[
         entry.entry_id

@@ -12,6 +12,7 @@ Exposes the following sensors:
  - Systolic pressure
  - Pulses
  - Measured date
+ - User
 
 ## Installation
 
