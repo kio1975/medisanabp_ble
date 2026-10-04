@@ -31,7 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     assert address is not None
     data = MedisanaBPBluetoothDeviceData()
 
-    def _needs_poll(
+    """def _needs_poll(
         service_info: BluetoothServiceInfoBleak, last_poll: float | None
     ) -> bool:
         # Only poll if hass is running, we need to poll,
@@ -70,7 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass, service_info.device.address, True
             )
             or connectable_device,
-        )
+        )"""
 
     coordinator = hass.data.setdefault(DOMAIN, {})[
         entry.entry_id
@@ -80,8 +80,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         address=address,
         mode=BluetoothScanningMode.PASSIVE,
         update_method=data.update,
-        needs_poll_method=_needs_poll,
-        poll_method=_async_poll,
+        #needs_poll_method=_needs_poll,
+        #poll_method=_async_poll,
         # We will take advertisements from non-connectable devices
         # since we will trade the BLEDevice for a connectable one
         # if we need to poll it
