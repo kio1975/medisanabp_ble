@@ -1,21 +1,10 @@
 {
-  "domain": "medisanabp_ble",
-  "name": "Medisana Blood Pressure BLE",
+"domain": "microlife_ble",
+"name": "Microlife Blood Pressure BLE",
   "bluetooth": [
+    
     {
-      "manufacturer_id": 18498,
-      "connectable": true
-    },
-    {
-      "manufacturer_id": 31256,
-      "connectable": true
-    },
-    {
-      "local_name": "1872B",
-      "connectable": true
-    },
-    {
-      "local_name": "1490BS",
+      "local_name": "B6 Connect",
       "connectable": true
     }
   ],
